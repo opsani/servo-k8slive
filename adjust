@@ -1,0 +1,457 @@
+import hashlib
+import kubernetes
+import os
+import time
+import yaml
+
+from adjust import Adjust, AdjustError
+
+VERSION = '0.0.1'
+
+config_path = os.environ.get('OPTUNE_CONFIG', './config.yaml')
+
+SERVO_POD_NAME = os.environ.get('POD_NAME')
+SERVO_POD_NAMESPACE = os.environ.get('POD_NAMESPACE')
+
+DEFAULT_COMPONENT = 'opsani_tuning'
+DEFAULT_POD_NAME = 'opsani-tuning'
+DEFAULT_SELECTOR = 'both'
+
+GIBIBYTE = 1073741824 # = 1024 * 1024 * 1024
+
+MEM_STEP = 0.125 # minimal useful increment in mem limit/reserve, GiB
+MIN_MEM = 0.125  # GiB
+MAX_MEM = 4.0  # GiB
+
+CPU_STEP = 0.125  # 12.5% (1/8) of a core
+MIN_CPU = 0.125  # cores
+MAX_CPU = 4.0  # cores
+
+REP_STEP = 1 # no. of replicas
+MIN_REP = 0 # no. of replicas
+MAX_REP = 1 # no. of replicas
+
+RESOURCE_MAP = {"mem": "memory", "cpu": "cpu"}
+DEFAULT_MAP = {
+    'mem': { 'min': MIN_MEM, 'max': MAX_MEM, 'step': MEM_STEP },
+    'cpu': { 'min': MIN_CPU, 'max': MAX_CPU, 'step': CPU_STEP },
+    'replicas': { 'min': MIN_REP, 'max': MAX_REP, 'step': REP_STEP }
+}
+
+class K8sLiveConnector(Adjust):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not (self.args.info or self.args.version):
+            self._load_config()
+            if os.getenv('KUBERNETES_SERVICE_HOST'): # If running in a kubernetes cluster
+                kubernetes.config.load_incluster_config()
+            else:
+                kubernetes.config.load_kube_config()
+            self.core_client = kubernetes.client.CoreV1Api()
+            self.apps_client = kubernetes.client.AppsV1Api()
+            self.exts_client = kubernetes.client.ExtensionsV1beta1Api()
+            self.autoscaling_client = kubernetes.client.AutoscalingV1Api()
+
+
+    def _load_config(self):
+        try:
+            config = yaml.safe_load(open(config_path))
+        except yaml.YAMLError as e:
+            raise Exception('Could not parse config file located at "{}". '
+                            'Please check its contents. Error: {}'.format(config_path, str(e)))
+
+        klive_conf = config.get('k8slive') or {}
+        k_conf = config['k8s']
+
+        klive_conf['settlement'] = k_conf.get('settlement', klive_conf.get('settlement'))
+        if klive_conf['settlement'] is None:
+            klive_conf.pop('settlement')
+        k_conf.update(klive_conf)
+
+        k_comps = list(k_conf['application']['components'].keys())
+        if len(k_comps) == 1:
+            tgt_comp = k_comps[0]
+        else:
+            raise Exception('K8s live connector does not support a k8s config with multiple compoenents' if k_comps\
+                else 'K8s live connector found no components in k8s config')
+        
+        #TODO validate config
+
+        self.servo_k8s_component = tgt_comp
+        self.servo_k8s_component_config = k_conf['application']['components'][tgt_comp]
+        self.servo_k8s_deployment_name, self.servo_k8s_container_name = tgt_comp, None
+        if '/' in tgt_comp:
+            self.servo_k8s_deployment_name, self.servo_k8s_container_name = tgt_comp.split('/')
+
+        # precedence of namespace configuration is as follows: OPTUNE_USE_DEFAULT_NAMESPACE > OPTUNE_NAMESPACE > configured namespace > servo app_id
+        env_namespace = 'default' if os.environ.get('OPTUNE_USE_DEFAULT_NAMESPACE') else os.environ.get('OPTUNE_USE_DEFAULT_NAMESPACE')
+        self.namespace = env_namespace if env_namespace else k_conf.get('namespace', self.app_id)
+
+        self.config = k_conf
+
+    
+    def _get_rsrc(self, cont_resources, setting_name, selector=None):
+        if selector is None:
+            selector = self.config.get('{}_selector'.format(setting_name), 'both')
+        tgt, backup = ('_limits', '_requests') if selector == 'limits' or selector == 'both' else ('_requests', '_limits' )
+        rn = RESOURCE_MAP[setting_name]
+
+        val = cont_resources.__dict__.get(tgt, {}).get(rn)
+        if val is None:
+            val = cont_resources.__dict__.get(backup, {}).get(rn)
+            if val is not None:
+                if selector != 'both':
+                    self.print_json_error(error='warning', cl=None,
+                        message='Using the non-selected {} value for resource "{}" as the selected {} value is not set'.format(backup, setting_name, tgt))
+            else:
+                val = "0"
+        return val
+
+    def _set_rsrc(self, target_container, setting_name, value):
+        rn = RESOURCE_MAP[setting_name]
+        sel = self.config.get('{}_selector'.format(setting_name), 'both')
+
+        sv = str(round(value,3))
+        if setting_name == "mem":
+            sv = '{}Gi'.format(float(round(value * GIBIBYTE)) / GIBIBYTE) # Round to nearest byte, internal memory representation is in GiB
+
+        if sel == 'both':
+            target_container.spec.resources.requests[rn] = sv
+            target_container.spec.resources.limits[rn] = sv
+        else:
+            tgt, disable = ('_requests', '_limits') if sel == 'request' else ('_limits', '_requests')
+            target_container.spec.resources.__dict__[tgt][rn] = sv
+            if target_container.spec.resources.__dict__[disable].get(rn):
+                target_container.spec.resources.__dict__[disable][rn] = None
+
+    def _get_tgt_dep_cont(self):
+        tgt_dep = self.apps_client.read_namespaced_deployment(self.servo_k8s_deployment_name, self.namespace)
+        if self.servo_k8s_container_name:
+            tgt_cont = next(iter(c for c in tgt_dep.spec.template.spec.containers if c.name == self.servo_k8s_container_name), None)
+            if tgt_cont is None:
+                raise Exception('Unable to locate configured container name {} in deployment {}'.format(self.servo_k8s_container_name, self.servo_k8s_deployment_name))
+        else:
+            tgt_cont = tgt_dep.spec.template.spec.containers[0]
+
+        return tgt_dep, tgt_cont # Note tgt_cont is a reference and non-assignment updates to this var will effect tgt_dep as well
+
+    def _try_read_namespaced_pod(self, name, namespace):
+        'Return None if pod is not found. Will raise other types of errors'
+        try:
+            return self.core_client.read_namespaced_pod(name=name, namespace=namespace)
+        except kubernetes.client.rest.ApiException as e:
+            if e.status != 404 or e.reason != 'Not Found':
+                raise
+            return None
+
+    def _check_pod_status(self, pod, servo_phase):
+        'Raises an error if pod containers have restarted or pod phase is Failed/Unknown'
+        container_restarts = [ cs for cs in pod.status.container_statuses if cs.restart_count > 0 ]
+        if container_restarts:
+            raise AdjustError("During {}; canary crash restart detected. Restarted container status(es): {}".format(servo_phase, container_restarts),
+                status="rejected", reason="unstable")
+
+        if pod.status.phase in ['Failed', 'Unknown']:
+            raise AdjustError("During {}; pod phase is {}. Status: {}".format(servo_phase, pod.status.phase, pod.status),
+                status='rejected', reason='start-failed' if servo_phase == 'rollout' else 'unstable')
+
+    def query(self):
+        settings = {'settings':{'cpu':{}, 'mem':{},'replicas':{}}}
+        for sn in ['mem', 'cpu', 'replicas']:
+            cfg = self.servo_k8s_component_config.get(sn, {})
+            settings['settings'][sn].update({
+                'min': cfg.get('min', DEFAULT_MAP[sn]['min']),
+                'max': cfg.get('max', DEFAULT_MAP[sn]['max']),
+                'step': cfg.get('step', DEFAULT_MAP[sn]['step']),
+                # 'pinned': cfg.get('pinned', None), TODO is k8s pinned config useful?
+            })
+
+        # get canary pod if it exists
+        canary_pod = self._try_read_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
+        tgt_dep, tgt_cont = self._get_tgt_dep_cont() # always get target for monitoring
+
+        if canary_pod:
+            canary_cont = next(iter(c for c in canary_pod.spec.containers if c.name == self.servo_k8s_container_name), None) \
+                if self.servo_k8s_container_name is not None else canary_pod.spec.containers[0]
+            if canary_cont is None:
+                raise Exception('Unable to locate configured container name {} in canary pod {}'\
+                    .format(self.servo_k8s_container_name, self.config.get('pod_name', DEFAULT_POD_NAME)))
+
+            settings['settings']['mem']['value'] = _memunits(self._get_rsrc(canary_cont.resources, 'mem'))
+            settings['settings']['cpu']['value'] = _cpuunits(self._get_rsrc(canary_cont.resources, 'cpu'))
+            settings['settings']['replicas']['value'] = 1
+        # otherwise, report values from target dep/container
+        else:
+            settings['settings']['mem']['value'] = _memunits(self._get_rsrc(tgt_cont.resources, 'mem', self.config.get('mem', {}).get('selector', 'both')))
+            settings['settings']['cpu']['value'] = _cpuunits(self._get_rsrc(tgt_cont.resources, 'cpu', self.config.get('cpu', {}).get('selector', 'both')))
+            settings['settings']['replicas']['value'] = 0
+
+        ref_pods = self.core_client.list_namespaced_pod( 
+            self.namespace, label_selector=','.join('{}={}'.format(l, v) for l, v in tgt_dep.spec.selector.match_labels.items())).items
+        monitoring = {
+            'instance_ids': [],
+            'runtime_id': None,
+            'spec_id': None,
+            'version_id': None,
+            'ref_instance_ids': [ p.metadata.uid for p in ref_pods ],
+            'ref_spec_id': _get_hash(tgt_dep.spec.template.spec),
+            'ref_version_id': _get_hash(tgt_cont.image),
+        }
+        monitoring['ref_runtime_id'] = _get_hash(monitoring['ref_instance_ids'])
+
+        if canary_pod:
+            monitoring['instance_ids'].append(canary_pod.metadata.uid)
+            monitoring['runtime_id'] = _get_hash(monitoring['instance_ids'])
+            monitoring['spec_id'] = _get_hash(canary_pod.spec)
+            monitoring['version_id'] = _get_hash(canary_cont.image)
+
+        return {
+            'monitoring': monitoring,
+            'application': {'components': { self.config.get('component', DEFAULT_COMPONENT): settings }}
+        }
+
+    def adjust(self, data):
+        if self.config.get('adjust_on', 'canary') != data["control"]["userdata"]["deploy_to"]:
+            return {"status": "ok", "reason": "Skipped due to 'adjust_on' condition"}
+
+        canary_data = data.get("application", {}).get("components", {}).get(self.config.get('component', DEFAULT_COMPONENT))
+        if canary_data is None:
+            return {"status": "ok", "reason": "Skipped due to no canary input"}
+
+        old_canary_pod = self._try_read_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
+        if old_canary_pod:
+            self.progress_message = 'Deleting existing canary pod'
+            self.print_progress()
+            destroy_status = self.core_client.delete_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
+            if destroy_status.status != 'Success':
+                raise AdjustError('Failed to destroy existing canary pod: {}'.format(destroy_status.__dict__),
+                    status='failed', reason='adjust-failed')
+
+            start_time = time.time()
+            while True:
+                old_canary_pod = self._try_read_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
+                if old_canary_pod is None:
+                    break
+
+                if time.time() - start_time > 630:
+                    raise AdjustError('Timed out waiting for existing canary pod to be destroyed pre-adjustment', status='failed', reason='adjust-failed')
+            
+            self.print_progress('Existing canary pod deleted')
+            
+        if canary_data.get('replicas', {}).get('value') == 0: # done here when replicas is 0
+            return { "status": "ok", "reason": ("Canary instance destroyed" if old_canary_pod else "No canary instance found") }
+
+        self.progress_message = 'Assembling new canary pod' # only send this update when this section takes longer than 30 seconds
+        tgt_dep, tgt_cont = self._get_tgt_dep_cont()
+        canary_pod = kubernetes.client.models.V1Pod(metadata=tgt_dep.spec.template.metadata, spec=tgt_dep.spec.template.spec) # TODO copy metadata selectively?
+
+        # Note tgt_cont is a reference to the target container in tgt_dep. Updates to tgt_cont will be reflected in tgt_dep and tgt_dep.spec.template.spec
+        for sn, sv in canary_data.items():
+            if sn == 'replicas':
+                if sv['value'] != 1: # If we did not destroy earlier, this will always be 1
+                    raise AdjustError('Unable to adjust canary replicas, only values of 0 and 1 are supported.')
+                continue
+            self._set_rsrc(tgt_cont, sn, sv['value'])
+
+        canary_pod.metadata.name = self.config.get('pod_name', DEFAULT_POD_NAME)
+        canary_pod.metadata.annotations['opsani.com/opsani_canary_for'] = self.servo_k8s_deployment_name
+        canary_pod.metadata.labels['opsani-role'] = 'canary'
+
+        if SERVO_POD_NAME is not None and SERVO_POD_NAMESPACE is not None:
+            servo_pod = self.core_client.read_namespaced_pod(name=SERVO_POD_NAME, namespace=SERVO_POD_NAMESPACE) # ephemeral
+            pod_controller = next(iter(ow for ow in servo_pod.metadata.owner_references if ow.controller))
+            servo_rs = self.apps_client.read_namespaced_replica_set(name=pod_controller.name, namespace=SERVO_POD_NAMESPACE) # still ephemeral
+            rs_controller = next(iter(ow for ow in servo_rs.metadata.owner_references if ow.controller))
+            # deployment info persists thru updates. only remove servo pod if deployment is deleted
+            servo_dep = self.apps_client.read_namespaced_deployment(name=rs_controller.name, namespace=SERVO_POD_NAMESPACE)
+
+            own_ref = kubernetes.client.models.V1OwnerReference(
+                api_version=servo_dep.metadata.api_version,
+                block_owner_deletion=False, # TODO will setting this to true cause issues or assist in waiting for cleanup?
+                controller=True, # Ensures the pod will not be adopted by another controller
+                kind='Deployment',
+                name=servo_dep.metadata.name,
+                uid=servo_dep.metadata.uid
+            )
+            canary_pod.metadata.owner_references.append(own_ref)
+
+        self.progress_message = 'Creating canary pod'
+        self.print_progress()
+        try:
+            created_canary_pod = self.core_client.create_namespaced_pod(self.namespace, body=canary_pod)
+        except Exception as e:
+            raise AdjustError('Error creating canary pod', status='failed', reason='adjust-failed') from e
+
+        self.progress_message = 'Waiting for canary pod container(s) to be ready'
+        self.print_progress()
+        start_time = time.time()
+        timeout = data.get('control', {}).get('timeout', self.config.get('timeout', 630))
+        try:
+            while True:
+                latest_canary_pod = self.core_client.read_namespaced_pod(created_canary_pod.metadata.name, self.namespace)
+                pod_ready = latest_canary_pod.status.container_statuses and all([cs.ready for cs in latest_canary_pod.status.container_statuses]) \
+                    and all([con.status == True for con in latest_canary_pod.status.conditions if con.type in ['Ready', 'ContainersReady']])
+                if pod_ready:
+                    break
+                self._check_pod_status(latest_canary_pod, 'rollout')
+
+                if time.time() - start_time > timeout:
+                    raise AdjustError('Timed out waiting for canary pod containers to be ready', status='failed', reason='start-failed')
+                time.sleep(30)
+        except AdjustError as e:
+            if e.reason not in ["start-failed", "unstable"]: # not undo-able
+                raise
+            onfail = self.config.get('on_fail', 'destroy') # valid values: nop, destroy (destroy == scale-to-zero)
+            self.progress_message = 'Adjust error raised during rollout, executing {} failure policy'.format(onfail)
+            self.print_progress()
+            # if onfail == "rollback" or onfail == "destroy_new":
+            #     pass TODO
+            if onfail == "destroy":
+                try:
+                    destroy_status = self.core_client.delete_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
+                    if destroy_status.status != 'Success':
+                        raise AdjustError('Failed to destroy canary pod during rollout destroy: {}'.format(destroy_status.__dict__),
+                            status='failed', reason='adjust-failed')
+
+                    start_time = time.time()
+                    while True:
+                        canary_pod = self._try_read_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
+                        if canary_pod is None:
+                            break
+
+                        if time.time() - start_time > 630:
+                            raise AdjustError('Timed out waiting for canary pod to be destroyed during rollout failure', status='failed', reason='adjust-failed')
+                except Exception as se:
+                    e.args = tuple([e.args[0]  + '. Destroy failed: {}'.format(se)]) + e.args[1:]
+                else:
+                    e.args = tuple([e.args[0]  + '. Destroy succeeded']) + e.args[1:]
+            raise
+            
+        mon0 = self.query()['monitoring']
+        settlement_time = data.get('control', {}).get('settlement', self.config.get('settlement')) # TODO default value?
+
+        if mon0["version_id"] != mon0["ref_version_id"]:
+            raise AdjustError("application version does not match reference version", status="aborted", reason="version-mismatch")
+
+        if settlement_time:
+            self.progress_message = 'Settlement; monitoring canary pod for instability over the next {} seconds'.format(settlement_time)
+            self.print_progress()
+            start_time = time.time()
+            try:
+                while time.time() - start_time < settlement_time:
+                    latest_canary_pod = self.core_client.read_namespaced_pod(created_canary_pod.metadata.name, self.namespace)
+                    pod_ready = latest_canary_pod.status.container_statuses and all([cs.ready for cs in latest_canary_pod.status.container_statuses]) \
+                        and all([con.status == True for con in latest_canary_pod.status.conditions if con.type in ['Ready', 'ContainersReady']])
+                    if not pod_ready:
+                        raise AdjustError('Canary pod became unready during settlement. Status{}'.format(latest_canary_pod.status), status="rejected", reason="unstable")
+                    self._check_pod_status(latest_canary_pod, 'settlement')
+
+                    mon = self.query()['monitoring']
+                    # check canary against mon0
+                    if mon["runtime_id"] != mon0["runtime_id"]: # restart detected
+                        raise AdjustError("during settlement; component(s) intentional restart detected", status="transient-failure", reason="app-restart")
+                    if mon["spec_id"] != mon0["spec_id"]:
+                        raise AdjustError("application configuration was modified unexpectedly during settlement", status="transient-failure", reason="app-update")
+                    # TODO: what to do with version change?
+                    # if mon["version_id"] != mon0["version_id"]:
+                    #     raise AdjustError("application was modified unexpectedly during settlement", status="transient-failure", reason="app-update")
+
+                    # check ref app against mon0
+                    if mon["ref_spec_id"] != mon0["ref_spec_id"]:
+                        raise AdjustError("reference application configuration was modified unexpectedly during settlement", status="transient-failure", reason="ref-app-update")
+                    if mon["ref_runtime_count"] != mon0["ref_runtime_count"]:
+                        raise AdjustError("reference application replicas count changed unexpectedly during settlement", status="transient-failure", reason="ref-app-scale")
+
+                    time.sleep(5)
+            except AdjustError as e:
+                if e.reason != "unstable": # not undo-able
+                    raise
+                onfail = self.config.get('on_fail', 'destroy') # valid values: nop, destroy (destroy == scale-to-zero)
+                self.progress_message = 'Adjust error raised during settlement, executing {} failure policy'.format(onfail)
+                self.print_progress()
+                # if onfail == "rollback" or onfail == "destroy_new":
+                #     pass TODO
+                if onfail == "destroy":
+                    try:
+                        destroy_status = self.core_client.delete_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
+                        if destroy_status.status != 'Success':
+                            raise AdjustError('Failed to destroy canary pod during settlement destroy: {}'.format(destroy_status.__dict__),
+                                status='failed', reason='adjust-failed')
+
+                        start_time = time.time()
+                        while True:
+                            canary_pod = self._try_read_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
+                            if canary_pod is None:
+                                break
+
+                            if time.time() - start_time > 630:
+                                raise AdjustError('Timed out waiting for canary pod to be destroyed during settlement failure', status='failed', reason='adjust-failed')
+                    except Exception as se:
+                        e.args = tuple([e.args[0]  + '. Destroy failed: {}'.format(se)]) + e.args[1:]
+                    else:
+                        e.args = tuple([e.args[0]  + '. Destroy succeeded']) + e.args[1:]
+                raise
+
+        return {"status": "ok", "reason": "Adjust complete"}
+
+# valid mem units: E, P, T, G, M, K, Ei, Pi, Ti, Gi, Mi, Ki
+# nb: 'm' suffix found after setting 0.7Gi
+mumap = {"E":1000**6,  "P":1000**5,  "T":1000**4,  "G":1000**3,  "M":1000**2,  "K":1000, "m":1000**-1,
+         "Ei":1024**6, "Pi":1024**5, "Ti":1024**4, "Gi":1024**3, "Mi":1024**2, "Ki":1024}
+def _memunits(s):
+    '''convert a string for memory resource (with optional unit suffix) into gibibytes (float)'''
+    for u, m in mumap.items():
+        if s.endswith(u):
+            return (float(s[:-len(u)]) * m) / GIBIBYTE
+    return float(s) / GIBIBYTE
+
+def _cpuunits(s):
+    '''convert a string for CPU resource (with optional unit suffix) into a number'''
+    if s[-1] == "m": # there are no units other than 'm' (millicpu)
+        return float(s[:-1])/1000.0
+    return float(s)
+
+def _get_hash(data):
+    """md5 hash of Python data. This is limited to scalars that are convertible to string and container
+    structures (list, dict) containing such scalars. Some data items are not distinguishable, if they have
+    the same representation as a string, e.g., hash(b'None') == hash('None') == hash(None)"""
+    # _dbg("get_hash", data)
+    hasher = hashlib.md5()
+    _dump_container(data, hasher.update)
+    return hasher.hexdigest()
+
+def _dump_container(c, func):
+    """stream the contents of a container as a string through a function
+    in a repeatable order, suitable, e.g., for hashing
+    """
+    #
+    if isinstance(c, dict): # dict
+        func("{".encode('utf-8'))
+        for k in sorted(c):# for all repeatable
+            func("{}:".format(k).encode('utf-8'))
+            _dump_container(c[k], func)
+            func(",".encode('utf-8'))
+        func("}".encode('utf-8'))
+    elif isinstance(c, list): # list
+        func("[".encode('utf-8'))
+        for k in sorted(c):# for all repeatable
+            _dump_container(k, func)
+            func(",".encode('utf-8'))
+        func("]".encode('utf-8'))
+    else: # everything else
+        if isinstance(c, type(b'')):
+            pass # already a stream, keep as is
+        elif isinstance(c, str):
+            # encode to stream explicitly here to avoid implicit encoding to ascii
+            c = c.encode('utf-8')
+        else:
+            c = str(c).encode('utf-8')  # convert to string (e.g., if integer)
+        func(c)         # simple value, string or convertible-to-string
+
+if __name__ == "__main__":
+    K8sLiveConnector(
+        VERSION,
+        "K8s canary orchestrator and connector for OCO servo.",
+        supports_cancel=False,
+        progress_interval=30
+    ).run()
