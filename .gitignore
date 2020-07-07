@@ -4,3 +4,5 @@
 *.pyc
 test/adjust_driver.py
 test/adjust.py
+/opsani-servo-auth.yaml
+scratch.txt
