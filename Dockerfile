@@ -4,7 +4,6 @@ FROM python:3.6-slim
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /servo
-RUN mkdir adjust.d
 
 # Install required packages
 ADD  https://storage.googleapis.com/kubernetes-release/release/v1.16.2/bin/linux/amd64/kubectl /usr/local/bin/
@@ -19,6 +18,8 @@ ADD https://raw.githubusercontent.com/opsani/servo-agg/master/adjust \
     https://raw.githubusercontent.com/opsani/servo/master/measure.py \
     https://raw.githubusercontent.com/opsani/servo/master/servo \
     /servo/
+
+RUN mkdir adjust.d
 
 ADD https://raw.githubusercontent.com/opsani/servo-k8s/status-rejected-onfail-destroy/adjust /servo/adjust.d/01-k8s-adjust
 ADD ./adjust /servo/adjust.d/02-k8slive-adjust

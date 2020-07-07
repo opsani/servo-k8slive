@@ -63,6 +63,7 @@ class K8sLiveConnector(Adjust):
 
         klive_conf = config.get('k8slive') or {}
         k_conf = config['k8s']
+        k_conf.pop('adjust_on', None)
 
         klive_conf['settlement'] = k_conf.get('settlement', klive_conf.get('settlement'))
         if klive_conf['settlement'] is None:
@@ -94,7 +95,7 @@ class K8sLiveConnector(Adjust):
     def _get_rsrc(self, cont_resources, setting_name, selector=None):
         if selector is None:
             selector = self.config.get('{}_selector'.format(setting_name), 'both')
-        tgt, backup = ('_limits', '_requests') if selector == 'limits' or selector == 'both' else ('_requests', '_limits' )
+        tgt, backup = ('_limits', '_requests') if selector == 'limits' else ('_requests', '_limits' )
         rn = RESOURCE_MAP[setting_name]
 
         val = cont_resources.__dict__.get(tgt, {}).get(rn)
@@ -117,13 +118,13 @@ class K8sLiveConnector(Adjust):
             sv = '{}Gi'.format(float(round(value * GIBIBYTE)) / GIBIBYTE) # Round to nearest byte, internal memory representation is in GiB
 
         if sel == 'both':
-            target_container.spec.resources.requests[rn] = sv
-            target_container.spec.resources.limits[rn] = sv
+            target_container.resources.requests[rn] = sv
+            target_container.resources.limits[rn] = sv
         else:
             tgt, disable = ('_requests', '_limits') if sel == 'request' else ('_limits', '_requests')
-            target_container.spec.resources.__dict__[tgt][rn] = sv
-            if target_container.spec.resources.__dict__[disable].get(rn):
-                target_container.spec.resources.__dict__[disable][rn] = None
+            target_container.resources.__dict__[tgt][rn] = sv
+            if target_container.resources.__dict__[disable].get(rn):
+                target_container.resources.__dict__[disable][rn] = None
 
     def _get_tgt_dep_cont(self):
         tgt_dep = self.apps_client.read_namespaced_deployment(self.servo_k8s_deployment_name, self.namespace)
@@ -147,19 +148,23 @@ class K8sLiveConnector(Adjust):
 
     def _check_pod_status(self, pod, servo_phase):
         'Raises an error if pod containers have restarted or pod phase is Failed/Unknown'
-        container_restarts = [ cs for cs in pod.status.container_statuses if cs.restart_count > 0 ]
-        if container_restarts:
-            raise AdjustError("During {}; canary crash restart detected. Restarted container status(es): {}".format(servo_phase, container_restarts),
-                status="rejected", reason="unstable")
+        if pod.status.container_statuses:
+            container_restarts = [ cs for cs in pod.status.container_statuses if cs.restart_count > 0 ]
+            if container_restarts:
+                raise AdjustError("During {}; canary crash restart detected. Restarted container status(es): {}".format(servo_phase, container_restarts),
+                    status="rejected", reason="unstable")
 
         if pod.status.phase in ['Failed', 'Unknown']:
             raise AdjustError("During {}; pod phase is {}. Status: {}".format(servo_phase, pod.status.phase, pod.status),
                 status='rejected', reason='start-failed' if servo_phase == 'rollout' else 'unstable')
 
     def query(self):
-        settings = {'settings':{'cpu':{}, 'mem':{},'replicas':{}}}
+        settings = {'settings':{'cpu':{'type': 'range'}, 'mem':{'type': 'range'},'replicas':{'type': 'range'}}}
         for sn in ['mem', 'cpu', 'replicas']:
-            cfg = self.servo_k8s_component_config.get(sn, {})
+            if sn != 'replicas':
+                cfg = self.servo_k8s_component_config.get('settings', {}).get(sn, {})
+            else:
+                cfg = {}
             settings['settings'][sn].update({
                 'min': cfg.get('min', DEFAULT_MAP[sn]['min']),
                 'max': cfg.get('max', DEFAULT_MAP[sn]['max']),
@@ -192,9 +197,11 @@ class K8sLiveConnector(Adjust):
         monitoring = {
             'instance_ids': [],
             'runtime_id': None,
+            'runtime_count': 0,
             'spec_id': None,
             'version_id': None,
             'ref_instance_ids': [ p.metadata.uid for p in ref_pods ],
+            'ref_runtime_count': tgt_dep.spec.replicas,
             'ref_spec_id': _get_hash(tgt_dep.spec.template.spec),
             'ref_version_id': _get_hash(tgt_cont.image),
         }
@@ -203,6 +210,7 @@ class K8sLiveConnector(Adjust):
         if canary_pod:
             monitoring['instance_ids'].append(canary_pod.metadata.uid)
             monitoring['runtime_id'] = _get_hash(monitoring['instance_ids'])
+            monitoring['runtime_count'] = 1
             monitoring['spec_id'] = _get_hash(canary_pod.spec)
             monitoring['version_id'] = _get_hash(canary_cont.image)
 
@@ -224,8 +232,8 @@ class K8sLiveConnector(Adjust):
             self.progress_message = 'Deleting existing canary pod'
             self.print_progress()
             destroy_status = self.core_client.delete_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
-            if destroy_status.status != 'Success':
-                raise AdjustError('Failed to destroy existing canary pod: {}'.format(destroy_status.__dict__),
+            if destroy_status.code is not None:
+                raise AdjustError('Failed to destroy existing canary pod: {}'.format(destroy_status),
                     status='failed', reason='adjust-failed')
 
             start_time = time.time()
@@ -239,7 +247,7 @@ class K8sLiveConnector(Adjust):
             
             self.print_progress('Existing canary pod deleted')
             
-        if canary_data.get('replicas', {}).get('value') == 0: # done here when replicas is 0
+        if canary_data['settings'].get('replicas', {}).get('value') == 0: # done here when replicas is 0
             return { "status": "ok", "reason": ("Canary instance destroyed" if old_canary_pod else "No canary instance found") }
 
         self.progress_message = 'Assembling new canary pod' # only send this update when this section takes longer than 30 seconds
@@ -247,7 +255,7 @@ class K8sLiveConnector(Adjust):
         canary_pod = kubernetes.client.models.V1Pod(metadata=tgt_dep.spec.template.metadata, spec=tgt_dep.spec.template.spec) # TODO copy metadata selectively?
 
         # Note tgt_cont is a reference to the target container in tgt_dep. Updates to tgt_cont will be reflected in tgt_dep and tgt_dep.spec.template.spec
-        for sn, sv in canary_data.items():
+        for sn, sv in canary_data['settings'].items():
             if sn == 'replicas':
                 if sv['value'] != 1: # If we did not destroy earlier, this will always be 1
                     raise AdjustError('Unable to adjust canary replicas, only values of 0 and 1 are supported.')
@@ -267,14 +275,14 @@ class K8sLiveConnector(Adjust):
             servo_dep = self.apps_client.read_namespaced_deployment(name=rs_controller.name, namespace=SERVO_POD_NAMESPACE)
 
             own_ref = kubernetes.client.models.V1OwnerReference(
-                api_version=servo_dep.metadata.api_version,
+                api_version=servo_dep.api_version,
                 block_owner_deletion=False, # TODO will setting this to true cause issues or assist in waiting for cleanup?
                 controller=True, # Ensures the pod will not be adopted by another controller
                 kind='Deployment',
                 name=servo_dep.metadata.name,
                 uid=servo_dep.metadata.uid
             )
-            canary_pod.metadata.owner_references.append(own_ref)
+            canary_pod.metadata.owner_references = [ own_ref ]
 
         self.progress_message = 'Creating canary pod'
         self.print_progress()
@@ -283,16 +291,20 @@ class K8sLiveConnector(Adjust):
         except Exception as e:
             raise AdjustError('Error creating canary pod', status='failed', reason='adjust-failed') from e
 
-        self.progress_message = 'Waiting for canary pod container(s) to be ready'
+        self.progress_message = 'Waiting for canary pod and container(s) to be ready'
         self.print_progress()
         start_time = time.time()
         timeout = data.get('control', {}).get('timeout', self.config.get('timeout', 630))
         try:
             while True:
                 latest_canary_pod = self.core_client.read_namespaced_pod(created_canary_pod.metadata.name, self.namespace)
-                pod_ready = latest_canary_pod.status.container_statuses and all([cs.ready for cs in latest_canary_pod.status.container_statuses]) \
-                    and all([con.status == True for con in latest_canary_pod.status.conditions if con.type in ['Ready', 'ContainersReady']])
-                if pod_ready:
+                
+                conts_ready = latest_canary_pod.status.container_statuses and all([cs.ready for cs in latest_canary_pod.status.container_statuses])
+                
+                rdy_conditions = [con for con in latest_canary_pod.status.conditions if con.type in ['Ready', 'ContainersReady']]
+                pod_ready = len(rdy_conditions) > 1 and all([con.status == 'True' for con in rdy_conditions])
+
+                if conts_ready and pod_ready:
                     break
                 self._check_pod_status(latest_canary_pod, 'rollout')
 
@@ -342,7 +354,7 @@ class K8sLiveConnector(Adjust):
                 while time.time() - start_time < settlement_time:
                     latest_canary_pod = self.core_client.read_namespaced_pod(created_canary_pod.metadata.name, self.namespace)
                     pod_ready = latest_canary_pod.status.container_statuses and all([cs.ready for cs in latest_canary_pod.status.container_statuses]) \
-                        and all([con.status == True for con in latest_canary_pod.status.conditions if con.type in ['Ready', 'ContainersReady']])
+                        and all([con.status == 'True' for con in latest_canary_pod.status.conditions if con.type in ['Ready', 'ContainersReady']])
                     if not pod_ready:
                         raise AdjustError('Canary pod became unready during settlement. Status{}'.format(latest_canary_pod.status), status="rejected", reason="unstable")
                     self._check_pod_status(latest_canary_pod, 'settlement')
@@ -375,7 +387,7 @@ class K8sLiveConnector(Adjust):
                 if onfail == "destroy":
                     try:
                         destroy_status = self.core_client.delete_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
-                        if destroy_status.status != 'Success':
+                        if destroy_status.code is not None:
                             raise AdjustError('Failed to destroy canary pod during settlement destroy: {}'.format(destroy_status.__dict__),
                                 status='failed', reason='adjust-failed')
 
