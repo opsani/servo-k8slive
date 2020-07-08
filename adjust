@@ -50,8 +50,6 @@ class K8sLiveConnector(Adjust):
                 kubernetes.config.load_kube_config()
             self.core_client = kubernetes.client.CoreV1Api()
             self.apps_client = kubernetes.client.AppsV1Api()
-            self.exts_client = kubernetes.client.ExtensionsV1beta1Api()
-            self.autoscaling_client = kubernetes.client.AutoscalingV1Api()
 
 
     def _load_config(self):
@@ -234,8 +232,16 @@ class K8sLiveConnector(Adjust):
         }
 
     def adjust(self, data):
-        if self.config.get('adjust_on', 'canary') != data["control"]["userdata"]["deploy_to"]:
-            return {"status": "ok", "reason": "Skipped due to 'adjust_on' condition"}
+        if self.config.get('adjust_on'):
+            try:
+                should_adjust = eval(self.config['adjust_on'], {'__builtins__': None}, {"data": data})
+            except:
+                should_adjust = False
+            if not should_adjust:
+                return {"status": "ok", "reason": "Skipped due to 'adjust_on' condition"}
+
+        if self.config.get('deploy_to', 'canary') != data["control"]["userdata"]["deploy_to"]:
+            return {"status": "ok", "reason": "Skipped due to 'deploy_to' condition"}
 
         canary_data = data.get("application", {}).get("components", {}).get(self.config.get('component', DEFAULT_COMPONENT))
         if canary_data is None:
