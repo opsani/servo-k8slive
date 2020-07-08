@@ -52,16 +52,16 @@ data:
                 max: 2.0
                 step: 0.125
                 pinned: True
-    k8slive:
-      settlement: 130
+    # k8slive:
+    #   settlement: 130
     prom:
       prometheus_endpoint: http://prometheus.opsani-monitoring.svc:9090
       metrics:
         main_request_rate:
-          query: sum(rate(envoy_cluster_upstream_rq_total{opsani-role="",app="web",role="main"}[1m]))
+          query: sum(rate(envoy_cluster_upstream_rq_total{opsani_role="",app="web",role="main"}[1m]))
           unit: rpm
         canary_request_rate:
-          query: sum(rate(envoy_cluster_upstream_rq_total{opsani-role="canary",app="web",role="main"}[1m]))
+          query: sum(rate(envoy_cluster_upstream_rq_total{opsani_role="canary",app="web",role="main"}[1m]))
           unit: rpm
 ---
 apiVersion: apps/v1
