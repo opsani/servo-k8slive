@@ -11,8 +11,8 @@ ADD  https://storage.googleapis.com/kubernetes-release/release/v1.16.2/bin/linux
 ADD ./requirements.txt /servo/
 RUN pip3 install -r requirements.txt
 
-ADD https://raw.githubusercontent.com/opsani/servo-agg/master/adjust \
-    https://raw.githubusercontent.com/opsani/servo-agg/master/util.py \
+ADD https://raw.githubusercontent.com/opsani/servo-agg/allow-monitoring-fix-adjusterror/adjust \
+    https://raw.githubusercontent.com/opsani/servo-agg/allow-monitoring-fix-adjusterror/util.py \
     https://raw.githubusercontent.com/opsani/servo-prom/master/measure \
     https://raw.githubusercontent.com/opsani/servo/master/adjust.py \
     https://raw.githubusercontent.com/opsani/servo/master/measure.py \
