@@ -166,7 +166,7 @@ class K8sLiveConnector(Adjust):
                 status='rejected', reason='start-failed' if servo_phase == 'rollout' else 'unstable')
 
         if pod.status.phase == 'Pending':
-            failed_schedule = any(c.type == 'PodScheduled' and c.status == 'False' for c in pod.status.conditions)
+            failed_schedule = pod.status.conditions and any(c.type == 'PodScheduled' and c.status == 'False' for c in pod.status.conditions)
             if failed_schedule:
                 raise AdjustError("During {}; pending pod failed sheduling. Status: {}".format(servo_phase, pod.status),
                     status='rejected', reason='scheduling-failed' if servo_phase == 'rollout' else 'unstable')
