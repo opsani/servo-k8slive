@@ -14,7 +14,7 @@ config_path = os.environ.get('OPTUNE_CONFIG', './config.yaml')
 SERVO_POD_NAME = os.environ.get('POD_NAME')
 SERVO_POD_NAMESPACE = os.environ.get('POD_NAMESPACE')
 
-DEFAULT_COMPONENT = 'opsani_tuning'
+DEFAULT_COMPONENT = 'opsani-tuning'
 DEFAULT_POD_NAME = 'opsani-tuning'
 DEFAULT_SELECTOR = 'both'
 
@@ -60,7 +60,7 @@ class K8sLiveConnector(Adjust):
                             'Please check its contents. Error: {}'.format(config_path, str(e)))
 
         klive_conf = config.get('k8slive') or {}
-        k_conf = config['k8s']
+        k_conf = config[klive_conf.get('main_section', 'k8s')]
         k_conf.pop('adjust_on', None)
 
         klive_conf['settlement'] = k_conf.get('settlement', klive_conf.get('settlement'))
