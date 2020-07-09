@@ -17,8 +17,9 @@ to become ready. Optionally, the connector may enforce a settlement period durin
 
 ## Configuration
 
-NOTE: k8s-live is not compatible with servo-k8s configurations that specify more than one component as they are beyond the scope of k8slive's use case.
-Such configurations will raise an error during connector initialization
+NOTE: k8s-live is not compatible with servo-k8s configurations that specify more than one component or adjustments that specify more than 1 replicas 
+as they are beyond the scope of k8slive's use case.Such configurations or adjustments will raise an error during connector initialization and adjustment 
+respectively.
 
 NOTE: when `selector` is set to both, the connector will report the value from the container requests if they are specified, otherwise it will report the value from limits.
 If neither are specified, it reports a value of 0
