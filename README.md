@@ -12,8 +12,9 @@ the deployment of the sole component in the servo-k8s config referred to by `mai
 `opsani_role: tuning` and annotation `opsani.com/opsani-tuning-for: [MAIN DEPLOYMENT NAME]` and updates its cpu, mem, and environement variables
 with the adjustment values sent to the servo-k8slive component
 
-The pods is then deployed with its owner references set to the servo deployment (for simplified cleanup) and the connector waits for the pod and containers
-to become ready. Optionally, the connector may enforce a settlement period during which it waits and monitors the pod for instability such as container restarts
+The pod is then deployed with its controller owner reference set to the servo deployment (for simplified cleanup) and the connector waits for the pod and 
+containers to become ready. Optionally, the connector may enforce a settlement period during which it waits and monitors the pod for instability such as 
+container restarts
 
 ## Configuration
 
