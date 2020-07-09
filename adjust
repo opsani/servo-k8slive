@@ -29,7 +29,7 @@ MIN_CPU = 0.125  # cores
 MAX_CPU = 4.0  # cores
 
 REP_STEP = 1 # no. of replicas
-MIN_REP = 0 # no. of replicas
+MIN_REP = 1 # no. of replicas
 MAX_REP = 1 # no. of replicas
 
 RESOURCE_MAP = {"mem": "memory", "cpu": "cpu"}
@@ -111,7 +111,7 @@ class K8sLiveConnector(Adjust):
         rn = RESOURCE_MAP[setting_name]
         sel = self.config.get('{}_selector'.format(setting_name), 'both')
 
-        sv = str(round(value,3))
+        sv = round(float(value),3)
         if setting_name == "mem":
             sv = '{}Gi'.format(float(round(value * GIBIBYTE)) / GIBIBYTE) # Round to nearest byte, internal memory representation is in GiB
 
@@ -148,7 +148,7 @@ class K8sLiveConnector(Adjust):
         'Returns bool indicating pod readiness'
         cont_stats = pod.status.container_statuses
         conts_ready = cont_stats and len(cont_stats) >= len(pod.spec.containers) and all([cs.ready for cs in pod.status.container_statuses])
-        rdy_conditions = [con for con in pod.status.conditions if con.type in ['Ready', 'ContainersReady']]
+        rdy_conditions = [] if not pod.status.conditions else [con for con in pod.status.conditions if con.type in ['Ready', 'ContainersReady']]
         pod_ready = len(rdy_conditions) > 1 and all([con.status == 'True' for con in rdy_conditions])
         return conts_ready and pod_ready
         
@@ -164,6 +164,12 @@ class K8sLiveConnector(Adjust):
         if pod.status.phase in ['Failed', 'Unknown']:
             raise AdjustError("During {}; pod phase is {}. Status: {}".format(servo_phase, pod.status.phase, pod.status),
                 status='rejected', reason='start-failed' if servo_phase == 'rollout' else 'unstable')
+
+        if pod.status.phase == 'Pending':
+            failed_schedule = any(c.type == 'PodScheduled' and c.status == 'False' for c in pod.status.conditions)
+            if failed_schedule:
+                raise AdjustError("During {}; pending pod failed sheduling. Status: {}".format(servo_phase, pod.status),
+                    status='rejected', reason='scheduling-failed' if servo_phase == 'rollout' else 'unstable')
 
     def query(self):
         settings = {'settings':{'cpu':{'type': 'range'}, 'mem':{'type': 'range'},'replicas':{'type': 'range'}}}
@@ -193,12 +199,28 @@ class K8sLiveConnector(Adjust):
             settings['settings']['mem']['value'] = _memunits(self._get_rsrc(canary_cont.resources, 'mem'))
             settings['settings']['cpu']['value'] = _cpuunits(self._get_rsrc(canary_cont.resources, 'cpu'))
             settings['settings']['replicas']['value'] = 1
+
+            tgt_env = canary_cont.env or []
         else:
             settings['settings']['mem']['value'] = _memunits(self._get_rsrc(tgt_cont.resources, 'mem', 
-                selector=self.servo_k8s_component_config.get('mem', {}).get('selector', 'both')))
+                selector=self.servo_k8s_component_config.get('settings', {}).get('mem', {}).get('selector', 'both')))
             settings['settings']['cpu']['value'] = _cpuunits(self._get_rsrc(tgt_cont.resources, 'cpu', 
-                selector=self.servo_k8s_component_config.get('cpu', {}).get('selector', 'both')))
+                selector=self.servo_k8s_component_config.get('settings', {}).get('cpu', {}).get('selector', 'both')))
             settings['settings']['replicas']['value'] = 0
+
+            tgt_env = tgt_cont.env or []
+
+        env = self.servo_k8s_component_config.get('env')
+        if env:
+            env_map = { e.name: e.value for e in tgt_env }
+            for en, ev in env.items():
+                if 'encoder' in ev:
+                    raise Exception('Unable to query environment variable {}. Encoders not supported yet'.format(en))
+                def_val = ev.pop('default', None)
+                cur_val = env_map.get(en)
+                if cur_val is None and def_val is None:
+                    raise Exception('Unable to query environment variable {}. No value defined in target container and no default configured'.format(en))
+                settings['settings'][en] = {**ev, 'value': (cur_val if cur_val is not None else def_val)}
 
         ref_pods = self.core_client.list_namespaced_pod(self.namespace, 
                 label_selector=','.join('{}={}'.format(l, v) 
@@ -276,10 +298,27 @@ class K8sLiveConnector(Adjust):
         # Note tgt_cont is a reference to the target container in tgt_dep. Updates to tgt_cont will be reflected in tgt_dep and tgt_dep.spec.template.spec
         for sn, sv in canary_data['settings'].items():
             if sn == 'replicas':
-                if sv['value'] != 1: # If we did not destroy earlier, this will always be 1
+                if sv['value'] != 1: # If we did not return earlier, this will always be 1
                     raise AdjustError('Unable to adjust canary replicas, only values of 0 and 1 are supported.')
                 continue
-            self._set_rsrc(tgt_cont, sn, sv['value'])
+            elif sn in ['cpu', 'mem']:
+                self._set_rsrc(tgt_cont, sn, sv['value'])
+            else:
+                env_sett = self.servo_k8s_component_config.get('env', {}).get(sn)
+                if env_sett is None:
+                    self.print_json_error("Warning", "Warning", "Unrecodnized setting adjustment recieved. Setting name: {}".format(sn))
+                    continue
+
+                if 'encoder' in env_sett:
+                    continue # TODO
+                if tgt_cont.env:
+                    tgt_env = next(iter(e for e in tgt_cont.env if e.name == sn), None)
+                    if tgt_env:
+                        tgt_env.value = str(sv['value']) # Note tgt_env is a reference so updating its value is reflected in tgt_cont
+                    else:
+                        tgt_cont.env.append(kubernetes.client.models.V1EnvVar(name=sn, value=str(sv['value'])))
+                else:
+                    tgt_cont.env = [kubernetes.client.models.V1EnvVar(name=sn, value=str(sv['value']))]
 
         canary_pod = kubernetes.client.models.V1Pod(metadata=tgt_dep.spec.template.metadata, spec=tgt_dep.spec.template.spec) # TODO copy metadata selectively?
 
