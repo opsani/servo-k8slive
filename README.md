@@ -25,8 +25,6 @@ respectively.
 NOTE: when `selector` is set to both, the connector will report the value from the container requests if they are specified, otherwise it will report the value from limits.
 If neither are specified, it reports a value of 0
 
-NOTE: the k8s-live component's descriptor reports the replicas setting guard rails as `min: 1, max: 1, step: 1` regardless of the current value
-
 ```yaml
 k8s:
   adjust_on: data["control"]["userdata"]["deploy_to"] == "main"

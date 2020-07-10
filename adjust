@@ -29,7 +29,7 @@ MIN_CPU = 0.125  # cores
 MAX_CPU = 4.0  # cores
 
 REP_STEP = 1 # no. of replicas
-MIN_REP = 1 # no. of replicas
+MIN_REP = 0 # no. of replicas
 MAX_REP = 1 # no. of replicas
 
 RESOURCE_MAP = {"mem": "memory", "cpu": "cpu"}
@@ -96,15 +96,15 @@ class K8sLiveConnector(Adjust):
         tgt, backup = ('_limits', '_requests') if selector == 'limits' else ('_requests', '_limits' )
         rn = RESOURCE_MAP[setting_name]
 
-        val = cont_resources.__dict__.get(tgt, {}).get(rn)
+        val = (cont_resources.__dict__.get(tgt) or {}).get(rn)
         if val is None:
-            val = cont_resources.__dict__.get(backup, {}).get(rn)
+            val = (cont_resources.__dict__.get(backup) or {}).get(rn)
             if val is not None:
                 if selector != 'both':
                     self.print_json_error(error='warning', cl=None,
                         message='Using the non-selected {} value for resource "{}" as the selected {} value is not set'.format(backup, setting_name, tgt))
             else:
-                val = "0"
+                val = None
         return val
 
     def _set_rsrc(self, target_container, setting_name, value):
@@ -466,6 +466,8 @@ mumap = {"E":1000**6,  "P":1000**5,  "T":1000**4,  "G":1000**3,  "M":1000**2,  "
          "Ei":1024**6, "Pi":1024**5, "Ti":1024**4, "Gi":1024**3, "Mi":1024**2, "Ki":1024}
 def _memunits(s):
     '''convert a string for memory resource (with optional unit suffix) into gibibytes (float)'''
+    if s is None:
+        return s
     for u, m in mumap.items():
         if s.endswith(u):
             return (float(s[:-len(u)]) * m) / GIBIBYTE
@@ -473,6 +475,8 @@ def _memunits(s):
 
 def _cpuunits(s):
     '''convert a string for CPU resource (with optional unit suffix) into a number'''
+    if s is None:
+        return s
     if s[-1] == "m": # there are no units other than 'm' (millicpu)
         return float(s[:-1])/1000.0
     return float(s)
