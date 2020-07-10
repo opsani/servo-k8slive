@@ -214,6 +214,7 @@ class K8sLiveConnector(Adjust):
         if env:
             env_map = { e.name: e.value for e in tgt_env }
             for en, ev in env.items():
+                ev = dict(ev) # make a copy (only need shallow)
                 if 'encoder' in ev:
                     raise Exception('Unable to query environment variable {}. Encoders not supported yet'.format(en))
                 def_val = ev.pop('default', None)
@@ -376,8 +377,8 @@ class K8sLiveConnector(Adjust):
             if onfail == "destroy":
                 try:
                     destroy_status = self.core_client.delete_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
-                    if destroy_status.status != 'Success':
-                        raise AdjustError('Failed to destroy tuning pod during rollout destroy: {}'.format(destroy_status.__dict__),
+                    if destroy_status.code is not None:
+                        raise AdjustError('Failed to destroy tuning pod during rollout destroy: {}'.format(destroy_status),
                             status='failed', reason='adjust-failed')
 
                     start_time = time.time()
@@ -440,7 +441,7 @@ class K8sLiveConnector(Adjust):
                     try:
                         destroy_status = self.core_client.delete_namespaced_pod(self.config.get('pod_name', DEFAULT_POD_NAME), self.namespace)
                         if destroy_status.code is not None:
-                            raise AdjustError('Failed to destroy tuning pod during settlement destroy: {}'.format(destroy_status.__dict__),
+                            raise AdjustError('Failed to destroy tuning pod during settlement destroy: {}'.format(destroy_status),
                                 status='failed', reason='adjust-failed')
 
                         start_time = time.time()
