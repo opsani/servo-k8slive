@@ -32,7 +32,7 @@ metadata:
 data:
   config.yaml: |
     k8s:
-      adjust_on: data["control"]["userdata"]["deploy_to"] == "mainline"
+      adjust_on: data["control"]["userdata"]["deploy_to"] == "main"
       namespace: app2
       application:
         components:
